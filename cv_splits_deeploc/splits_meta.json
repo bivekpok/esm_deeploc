@@ -1,0 +1,52 @@
+{
+  "cv_scheme": "paper",
+  "inner_val_strategy": "paper",
+  "n_outer": 5,
+  "inner_val_fraction": 0.1,
+  "random_state": 42,
+  "membrane_only": false,
+  "label_csv": "/work/hdd/bdja/bpokhrel/deeploc/Swissprot_Train_Validation_dataset.csv",
+  "external_test_csv": "/work/hdd/bdja/bpokhrel/deeploc/hpa_testset.csv",
+  "folds": [
+    {
+      "fold": 1,
+      "p_val": 0,
+      "n_train": 22340,
+      "n_val": 5963,
+      "n_test": 0,
+      "cv_scheme": "paper"
+    },
+    {
+      "fold": 2,
+      "p_val": 1,
+      "n_train": 22852,
+      "n_val": 5451,
+      "n_test": 0,
+      "cv_scheme": "paper"
+    },
+    {
+      "fold": 3,
+      "p_val": 2,
+      "n_train": 22572,
+      "n_val": 5731,
+      "n_test": 0,
+      "cv_scheme": "paper"
+    },
+    {
+      "fold": 4,
+      "p_val": 3,
+      "n_train": 22607,
+      "n_val": 5696,
+      "n_test": 0,
+      "cv_scheme": "paper"
+    },
+    {
+      "fold": 5,
+      "p_val": 4,
+      "n_train": 22841,
+      "n_val": 5462,
+      "n_test": 0,
+      "cv_scheme": "paper"
+    }
+  ]
+}

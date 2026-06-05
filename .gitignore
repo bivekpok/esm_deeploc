@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Data (download separately — see README)
+*.csv
+!cv_splits_deeploc/**/*.csv
+*.pdf
+
+# Training outputs & logs
+cv_results_deeploc*/
+log/*.out
+log/*.err
+log/train_*
+hpa_eval_results/
+wandb/
+sweeps/
+
+# Legacy experiments (not part of main pipeline)
+code/
+.tmp_pypdf/
+.deeploc2_paper_extract.txt
+
+# Checkpoints / adapters
+*.pth
+*.pt
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

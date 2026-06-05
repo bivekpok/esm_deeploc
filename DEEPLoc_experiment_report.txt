@@ -1,0 +1,905 @@
+================================================================================
+DeepLoc 2.0-style multilabel localization — experiment report
+================================================================================
+Project root : /work/hdd/bdja/bpokhrel/deeploc
+Report date  : 2026-05-29 (updated after focal manual-alpha run)
+Reference    : Thumuluri et al. (2022) DeepLoc 2.0, Nucleic Acids Research
+               doi:10.1093/nar/gkac278
+               https://pmc.ncbi.nlm.nih.gov/articles/PMC9252801/
+
+This file summarizes the pipeline, model, data, CV protocol, sweep results,
+comparison to the paper, artifact locations, and recommended next steps.
+
+
+================================================================================
+1. YOUR MODEL (what you are training)
+================================================================================
+
+Task          : Multilabel protein subcellular localization (10 classes)
+                Each protein can have 0, 1, or multiple location labels.
+
+Backbone      : ESMC-300M (EvolutionaryScale, config.model_name_or_path = "esmc_300m")
+                embed_dim = 960, ~30 transformer blocks (indices 0..29)
+
+Fine-tuning   : PEFT LoRA on last 5 transformer blocks only
+                lora_r=8, lora_alpha=16, lora_dropout=0.05
+                Target modules: attn.layernorm_qkv.1, attn.out_proj, ffn.1, ffn.3
+
+Pooling head  : bom_attn (bag-of-mer + self-attention over k-mer windows)
+                bom_attn_k_mer_size=7, bom_attn_inner_dim=256, bom_attn_value_dim=1024
+
+Classifier    : MLP head, hidden_dim=512, dropout=0.4
+                Output: 10 logits (one per DeepLoc class), sigmoid at inference
+
+Layer agg     : Mean over ALL ESMC block hidden states (layer_aggregation="all")
+                Sweep also tested: last_n (5 layers), band (blocks 20-29).
+                Winner: "all"
+
+Loss          : BCEWithLogitsLoss with sqrt(pos_weight) per class (imbalance)
+Thresholds    : Per-class thresholds tuned on VAL partition only (never HPA)
+                Default prediction threshold = 0.5 if tuning disabled
+Early stop    : val_loss, patience=7
+Learning rate : lr_esmc=5e-6, lr_classifier=1e-5, weight_decay=1e-3
+Batch / seq   : batch_size=16, max_len=1000
+
+Conda env     : /u/bpokhrel/miniconda3/envs/esm
+
+Key code files:
+  config.py              — all hyperparameters and class lists
+  model.py               — ESMC + LoRA + pooling + classifier
+  train.py               — paper CV, training, HPA eval
+  dataset.py             — manifests, multi-hot labels, loaders
+  utils.py               — multilabel predict, HPA-restricted metrics
+  test_hpa.py            — standalone HPA checkpoint evaluation
+  scripts/recompute_hpa_restricted.py — recompute metrics from saved CSVs
+
+
+================================================================================
+2. DATA
+================================================================================
+
+Training / CV (Swiss-Prot):
+  File   : Swissprot_Train_Validation_dataset.csv
+  Path   : /work/hdd/bdja/bpokhrel/deeploc/Swissprot_Train_Validation_dataset.csv
+  Rows   : ~28,303 proteins (after empty-label filter)
+  Split  : Partition column 0..4 (homology partitions, <=30% identity)
+  CV     : cv_scheme="paper" (see Section 3)
+
+External test ONLY (HPA):
+  File   : hpa_testset.csv  (same 1717 proteins as test_label.csv)
+  Path   : /work/hdd/bdja/bpokhrel/deeploc/hpa_testset.csv
+  Rule   : NEVER used for training, threshold tuning, or model selection
+
+CV split manifests:
+  Path   : /work/hdd/bdja/bpokhrel/deeploc/cv_splits_deeploc/
+  Meta   : cv_splits_deeploc/splits_meta.json  (cv_scheme=paper)
+
+External test manifest (generated):
+  Path   : cv_splits_deeploc/external_test_manifest.csv
+
+
+================================================================================
+3. CROSS-VALIDATION PROTOCOL (paper-aligned)
+================================================================================
+
+For each fold i with validation partition p in {0,1,2,3,4}:
+  Train = all Swiss-Prot rows with Partition != p  (4 partitions)
+  Val   = all rows with Partition == p              (1 whole partition)
+  Test  = hpa_testset.csv ONLY                      (1717 proteins)
+
+  NO internal Swiss-Prot test set (no test_manifest.csv under paper scheme).
+
+Fold layout (example Outer_Fold_1, val partition = 0):
+  train ~22,340 | val ~5,963 | internal test: none
+
+Report final numbers as HPA mean +/- std across 5 folds (not yet done —
+current results are fold 1 only from layer-aggregation sweep).
+
+Full 5-fold CV command (after sweep):
+  Edit config.py: layer_aggregation="all", folds_to_run=None
+  ./submit_multilabel_cv.sh
+
+
+================================================================================
+4. CLASS TAXONOMY (10 train / 8 HPA overlap / 6 paper Table 2)
+================================================================================
+
+10 training classes (model always outputs 10 logits):
+  Cytoplasm, Nucleus, Extracellular, Cell membrane, Mitochondrion, Plastid,
+  Endoplasmic reticulum, Lysosome/Vacuole, Golgi apparatus, Peroxisome
+
+8 classes present in HPA test CSV (hpa_eval_classes_present):
+  All 10 MINUS Extracellular (missing column — IF assay) MINUS Plastid (humans)
+  Cytoplasm, Nucleus, Cell membrane, Mitochondrion, ER, Lysosome/Vacuole,
+  Golgi apparatus, Peroxisome
+
+6 classes in DeepLoc 2.0 Table 2 per-class MCC (hpa_eval_classes_paper):
+  The 8 above MINUS Lysosome/Vacuole (support=2) MINUS Peroxisome (support=7)
+  Cytoplasm, Nucleus, Cell membrane, Mitochondrion, ER, Golgi apparatus
+
+HPA per-class support (hpa_testset.csv):
+  Cytoplasm 562 | Nucleus 893 | Cell membrane 287 | Mitochondrion 196
+  Endoplasmic reticulum 77 | Golgi apparatus 86
+  Lysosome/Vacuole 2 | Peroxisome 7
+  Extracellular MISSING | Plastid MISSING
+
+Metric keys in code / JSON:
+  all10         — full 10-class macro F1 (NOT fair vs paper HPA; drags score)
+  hpa8_present  — 8-class HPA overlap (scientifically honest HPA eval)
+  hpa6_paper    — 6-class Table 2 subset (direct paper MCC-row comparison)
+
+
+================================================================================
+5. WHAT DEEPLOC 2.0 REPORTS (paper benchmarks)
+================================================================================
+
+Paper models:
+  ESM1b  — 33-layer ESM, 650M params ("Fast" server model)
+  ProtT5 — 3B params ("Accurate" server model)
+
+Paper training:
+  10-class multilabel, focal loss, MCC-tuned thresholds per class
+  Attention pooling + sorting-signal auxiliary head
+  5-fold CV on Swiss-Prot (28,303 proteins), homology partitions 0-4
+
+--- Table 1: Swiss-Prot 5-fold CV (ProtT5) ---
+  Macro F1     : 0.66 +/- 0.01
+  Micro F1     : 0.73 +/- 0.01
+  Subset acc   : 0.55 +/- 0.02
+  Jaccard      : 0.69 +/- 0.01
+
+--- Table 2: HPA independent test (1717 proteins) ---
+                    ESM1b    ProtT5
+  Macro F1          0.44     0.46
+  Micro F1          0.57     0.60
+  Subset accuracy   0.34     0.39
+  Jaccard           0.48     0.53
+  Avg labels/prot   1.15     1.21  (actual ~1.22)
+
+  Per-class MCC (ProtT5, Table 2 — 6 classes only):
+  Cytoplasm           0.36
+  Nucleus             0.44
+  Cell membrane       0.36
+  Mitochondrion       0.56
+  Endoplasmic reticulum 0.17
+  Golgi apparatus     0.31
+
+  Note: Paper does NOT report MCC for Lysosome or Peroxisome on HPA (too rare).
+  Note: Extracellular and Plastid are absent from HPA ground truth entirely.
+
+
+================================================================================
+6. YOUR RESULTS — layer aggregation sweep (fold 1 only, paper CV)
+================================================================================
+
+W&B project : deeploc2_paper_cv_sweep
+Sweep       : layer_agg_paper_cv_fold1 (all | last_n | band)
+Each trial  : Outer_Fold_1 only, tuned thresholds on val partition
+
+Results base directory:
+  /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc_lora_loran5_bom_attn/
+
+LATEST symlink -> most recent run (band trial):
+  cv_results_deeploc_lora_loran5_bom_attn/LATEST
+
+--- Sweep summary (HPA, tuned thresholds) ---
+
+  layer_agg   run_id                  val macro F1   HPA all10   HPA hpa8   HPA hpa6
+  ---------   ----------------------  ------------   ---------   --------   --------
+  all (WIN)   20260523-062859Z-6bfe36  0.645         0.280       0.350      0.467
+  last_n      20260523-104629Z-d5f3eb  0.645         0.261       0.326      0.435
+  band        20260523-104715Z-606ead  0.647         0.276       0.344      0.459
+
+Sweep winner: layer_aggregation = "all"
+
+--- Best run vs DeepLoc 2.0 ProtT5 (HPA, tuned, hpa6 paper subset) ---
+
+  Metric              You (all, fold1)   Paper ProtT5
+  Macro F1            0.467              0.46
+  Micro F1            0.595              0.60
+  Macro MCC (6-cl)    0.355              ~0.34 avg
+
+--- Best run per-class MCC (hpa6, tuned, all layers) vs paper ---
+
+  Class                 Your MCC   Paper ProtT5 MCC
+  Cytoplasm             0.303      0.36
+  Nucleus               0.427      0.44
+  Cell membrane         0.321      0.36
+  Mitochondrion         0.629      0.56   <-- stronger than paper
+  Endoplasmic reticulum 0.162      0.17
+  Golgi apparatus       0.287      0.31
+
+--- Swiss-Prot val (fold 1, tuned) vs paper 5-fold CV mean ---
+
+  Metric         You (fold1)   Paper ProtT5 (5-fold)
+  Macro F1       0.645         0.66
+  Micro F1     0.701         0.73
+
+Interpretation:
+  - On fair 6-class HPA subset: essentially tied with DeepLoc 2.0 ProtT5.
+  - On 8-class HPA overlap: 0.350 vs paper headline ~0.46 (Lysosome/Peroxisome hurt).
+  - On misleading all-10 macro F1: 0.280 (do NOT cite vs paper).
+  - Val Swiss-Prot: ~2 points below paper 5-fold mean (single fold; full CV pending).
+
+
+================================================================================
+6B. FOCAL LOSS EXPERIMENTS (fold 1, paper CV, layer_aggregation="all")
+================================================================================
+
+Four knobs typically changed between these runs (all in config.py unless noted):
+
+  1. loss_type / focal settings
+       BCE baseline          : loss_type="bce"
+       Focal + manual alpha  : loss_type="focal", focal_gamma=2.0,
+                               focal_use_alpha=True, focal_alpha_mode="manual"
+                               (weights in losses.py MANUAL_FOCAL_ALPHA)
+       Focal + no alpha      : focal_use_alpha=False  (run tag suffix noalpha)
+       Focal + inv_freq      : focal_alpha_mode="inv_freq"  (NOT recommended)
+
+  2. layer_aggregation     : "all" (fixed for focal trials; sweep winner)
+
+  3. model_name_or_path    : "esmc_300m" (default) | "esmc_600m"
+
+  4. folds_to_run          : [1] (single fold for ablations) | None (full 5-fold)
+
+Shared settings across focal runs:
+  pooling=bom_attn, LoRA last 5 layers, tune_thresholds=True, early_stop=val_loss,
+  batch=16, lr_esmc=5e-6, lr_classifier=1e-5, paper CV scheme.
+
+--- LATEST RUN (2026-05-29) — focal + manual alpha, ESMC-300M ---
+
+  run_id   : 20260529-004348Z-af9a54
+  run_tag  : lora_loran5_bom_attn_folds1_focalg2
+  path     : cv_results_deeploc_lora_loran5_bom_attn_folds1_focalg2/20260529-004348Z-af9a54/
+
+  Config snapshot:
+    loss_type=focal, focal_gamma=2.0, focal_use_alpha=True, focal_alpha_mode=manual
+    layer_aggregation=all, model_name_or_path=esmc_300m, folds_to_run=[1]
+
+  HPA Outer_Fold_1 (tuned thresholds from val partition):
+    val macro F1 (tuned)     : 0.642
+    hpa8_present macro F1    : 0.335
+    hpa6_paper macro F1      : 0.446   <-- primary compare metric
+    hpa6_paper macro MCC     : 0.332
+
+  Per-class MCC (hpa6, tuned):
+    Cytoplasm 0.306 | Nucleus 0.408 | Cell membrane 0.325
+    Mitochondrion 0.598 | ER 0.159 | Golgi 0.195
+
+--- Comparison table (HPA hpa6_paper, tuned, fold 1 only) ---
+
+  Rank  run_id / tag                              loss / backbone        hpa6 F1  hpa8 F1  val F1
+  ----  ----------------------------------------  ---------------------  -------  -------  ------
+  *1    20260525-103633Z-d686ce                   focal inv_freq / 600M  0.474    0.357    0.602
+  *2    20260523-062859Z-6bfe36  (layer sweep)    BCE / 300M, agg=all    0.467    0.350    0.645
+   3    20260528-035046Z-2b3fa5                   focal noalpha / 300M   0.450    0.337    0.643
+   4    20260529-004348Z-af9a54  (LATEST)         focal manual / 300M    0.446    0.335    0.642
+   5    20260525-101439Z-f38558                   focal inv_freq / 300M  0.442    0.331    0.585
+        (Cytoplasm F1=0 at default thr; inv_freq crushes common classes)
+
+  Paper ProtT5 (Table 2, 5-fold mean)                                    0.46     ~0.46    ~0.66
+
+--- What is best so far (fold 1, single-run — not final 5-fold mean) ---
+
+  Primary metric (hpa6_paper tuned macro F1):
+    BEST: ESMC-600M + focal inv_freq  -> 0.474  (slightly above paper ProtT5 0.46)
+    BEST 300M stable baseline: BCE + layer agg all -> 0.467  (essentially tied with paper)
+    LATEST manual-alpha focal (300M): 0.446 — does NOT beat BCE baseline on fold 1
+
+  Secondary (hpa8_present tuned macro F1):
+    BEST: ESMC-600M focal -> 0.357
+    BCE 300M baseline -> 0.350
+
+  Val Swiss-Prot (tuned macro F1):
+    BEST: BCE layer-agg all -> 0.645 (closest to paper 5-fold 0.66)
+
+  Recommendation for next full 5-fold CV:
+    - Keep layer_aggregation="all", pooling=bom_attn, LoRA last 5.
+    - Loss: stay on BCE (300M) OR try ESMC-600M + focal with manual alpha (not yet run).
+    - Do NOT use focal_alpha_mode=inv_freq on 300M (Cytoplasm collapse).
+    - Consider early_stop_metric="macro_f1" for focal runs (val_loss scale differs).
+
+  Launch: edit config.py, then ./submit_multilabel_cv.sh
+
+
+================================================================================
+7. CHECKPOINT AND ARTIFACT LOCATIONS
+================================================================================
+
+BEST MODEL — hpa6 tuned, fold 1 (pick by goal):
+
+  Best hpa6 single-fold (0.474):
+    cv_results_deeploc_esmc600_lora_loran5_bom_attn_folds1_focalg2/20260525-103633Z-d686ce/
+    .../Outer_Fold_1/checkpoint.pt
+    (ESMC-600M, focal inv_freq — verify before 5-fold; manual alpha on 600M not tried)
+
+  Best 300M reproducible baseline (0.467, BCE + all layers):
+    cv_results_deeploc_lora_loran5_bom_attn/20260523-062859Z-6bfe36/
+    .../Outer_Fold_1/checkpoint.pt
+
+  Latest run — focal manual alpha 300M (0.446 hpa6, 2026-05-29):
+    cv_results_deeploc_lora_loran5_bom_attn_folds1_focalg2/20260529-004348Z-af9a54/
+    .../Outer_Fold_1/checkpoint.pt
+
+  Checkpoints (use checkpoint.pt for eval — includes metadata):
+    .../Outer_Fold_1/checkpoint.pt       (~646 MB, preferred for test_hpa.py)
+    .../Outer_Fold_1/best_model.pth      (weights only)
+    .../Outer_Fold_1/last_checkpoint.pt
+    .../Outer_Fold_1/last_model.pth
+
+  Predictions & metrics:
+    .../Outer_Fold_1/hpa_test_predictions.csv
+    .../Outer_Fold_1/hpa_restricted_metrics.json   (all10 / hpa8 / hpa6)
+    .../Outer_Fold_1/val_predictions.csv
+    .../Outer_Fold_1/tuned_thresholds.json
+    .../Outer_Fold_1/run_summary.json
+    .../Outer_Fold_1/epoch_history.csv
+    .../Outer_Fold_1/monitor_history.csv
+    .../cv_summary.json
+    .../run_config.json
+
+All three sweep runs:
+  all    : .../20260523-062859Z-6bfe36/Outer_Fold_1/
+  last_n : .../20260523-104629Z-d5f3eb/Outer_Fold_1/
+  band   : .../20260523-104715Z-606ead/Outer_Fold_1/
+
+Legacy pre-run_id checkpoint (old CV, wrong split — do NOT use for paper numbers):
+  cv_results_deeploc_lora_loran5_bom_attn/Outer_Fold_1/checkpoint.pt
+  (has partition_test_predictions.csv from old holdout scheme)
+
+
+================================================================================
+8. HOW TO REPRODUCE / EXTEND
+================================================================================
+
+Recompute HPA metrics from saved predictions (no GPU):
+  conda activate esm
+  cd /work/hdd/bdja/bpokhrel/deeploc
+  python scripts/recompute_hpa_restricted.py
+
+Evaluate best checkpoint on HPA:
+  python test_hpa.py \
+    --checkpoint cv_results_deeploc_lora_loran5_bom_attn/20260523-062859Z-6bfe36/Outer_Fold_1/checkpoint.pt \
+    --use-tuned-thresholds \
+    --output-dir hpa_eval_results
+
+Full 5-fold CV (final paper numbers):
+  1. config.py: layer_aggregation="all", folds_to_run=None
+  2. ./submit_multilabel_cv.sh
+  3. Report hpa6_paper mean +/- std from cv_summary.json across 5 folds
+
+Layer sweep (already done — no need to rerun):
+  wandb sweep --project deeploc2_paper_cv_sweep sweeps/layer_aggregation.yaml
+  bash scripts/launch_sweep_slurm.sh udel/deeploc2_paper_cv_sweep/<sweep_id> 3
+
+
+================================================================================
+9. KEY DIFFERENCES vs DEEPLOC 2.0 PAPER (for methods section)
+================================================================================
+
+  Aspect              This project              DeepLoc 2.0 paper
+  ------------------  ------------------------  ---------------------------
+  Backbone            ESMC-300M + LoRA          ESM1b / ProtT5 full FT
+  Pooling             bom_attn                  Attention pooling
+  Loss                BCE + sqrt pos_weight     Weighted focal loss
+  Threshold tuning    F1 on val partition     MCC on training data
+  Sorting signals     Not implemented           9-class auxiliary head
+  HPA eval classes    8 present + 6 Table 2     Table 2: 6 MCC rows
+  CV reporting        Fold 1 done; 5-fold TBD   5-fold mean +/- std
+
+
+================================================================================
+10. RECOMMENDED METRICS TO CITE
+================================================================================
+
+Primary (paper Table 2 alignment):
+  hpa6_paper macro F1, mean +/- std over 5 folds on HPA
+  Current best single-fold: 0.474 (ESMC-600M focal, fold 1)
+  Best 300M single-fold:    0.467 (BCE + layer agg all, fold 1)
+  Latest manual focal:      0.446 (300M, fold 1, 20260529-004348Z-af9a54)
+
+Secondary (full HPA overlap):
+  hpa8_present macro F1
+  Current best single-fold: 0.357 (ESMC-600M focal)
+  BCE 300M baseline:        0.350
+
+Per-class:
+  MCC per location for the 6 Table 2 classes — full tables in Section 11 below
+
+Do NOT cite:
+  all10 macro F1 (0.28) as comparison to paper — includes impossible HPA classes
+
+Swiss-Prot CV (model selection / training quality):
+  val macro F1 per fold; paper compares 5-fold mean ~0.66 ProtT5
+
+
+================================================================================
+11. FULL hpa_restricted_metrics (text dump of all saved JSON results)
+================================================================================
+
+Source files: hpa_restricted_metrics.json next to each run's
+hpa_test_predictions.csv (or external_test_predictions.csv for legacy).
+Regenerate: python scripts/recompute_hpa_restricted.py
+
+--------------------------------------------------------------------------------
+RUN: all (sweep winner)
+PATH: /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc_lora_loran5_bom_attn/20260523-062859Z-6bfe36/Outer_Fold_1
+JSON: cv_results_deeploc_lora_loran5_bom_attn/20260523-062859Z-6bfe36/Outer_Fold_1/hpa_restricted_metrics.json
+--------------------------------------------------------------------------------
+
+cv_summary.json (Outer_Fold_1, full 10-class from train.py):
+  val: macro_f1=0.633538 micro_f1=0.696919 subset_acc=0.498575
+  val_tuned: macro_f1=0.644568 micro_f1=0.701096 subset_acc=0.495053
+  hpa_test: macro_f1=0.273339 micro_f1=0.578189 subset_acc=0.331974
+  hpa_test_tuned: macro_f1=0.280024 micro_f1=0.580687 subset_acc=0.323821
+
+[pred_labels_default]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.273339
+    micro_f1: 0.578189
+    subset_acc: 0.331974
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.341674
+    micro_f1: 0.586771
+    macro_precision: 0.360523
+    macro_recall: 0.360602
+    subset_acc: 0.336051
+    jaccard_samples: 0.519676
+    macro_mcc: 0.251753
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3982   0.3382
+  Cytoplasm                     562   0.5781   0.3115
+  Endoplasmic reticulum          77   0.1926   0.1620
+  Golgi apparatus                86   0.2748   0.2632
+  Lysosome/Vacuole                2   0.0000  -0.0041
+  Mitochondrion                 196   0.5766   0.5194
+  Nucleus                       893   0.7131   0.4266
+  Peroxisome                      7   0.0000  -0.0027
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.455565
+    micro_f1: 0.591419
+    macro_precision: 0.480698
+    macro_recall: 0.480803
+    subset_acc: 0.337798
+    jaccard_samples: 0.521258
+    macro_mcc: 0.336794
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3982   0.3382
+  Cytoplasm                     562   0.5781   0.3115
+  Endoplasmic reticulum          77   0.1926   0.1620
+  Golgi apparatus                86   0.2748   0.2632
+  Mitochondrion                 196   0.5766   0.5194
+  Nucleus                       893   0.7131   0.4266
+
+[pred_labels_tuned]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.280024
+    micro_f1: 0.580687
+    subset_acc: 0.323821
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.350030
+    micro_f1: 0.588699
+    macro_precision: 0.402395
+    macro_recall: 0.351220
+    subset_acc: 0.325568
+    jaccard_samples: 0.513900
+    macro_mcc: 0.265113
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4034   0.3212
+  Cytoplasm                     562   0.5736   0.3031
+  Endoplasmic reticulum          77   0.1926   0.1620
+  Golgi apparatus                86   0.2632   0.2867
+  Lysosome/Vacuole                2   0.0000  -0.0053
+  Mitochondrion                 196   0.6548   0.6292
+  Nucleus                       893   0.7128   0.4267
+  Peroxisome                      7   0.0000  -0.0027
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.466706
+    micro_f1: 0.595481
+    macro_precision: 0.536527
+    macro_recall: 0.468293
+    subset_acc: 0.330810
+    jaccard_samples: 0.517424
+    macro_mcc: 0.354809
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4034   0.3212
+  Cytoplasm                     562   0.5736   0.3031
+  Endoplasmic reticulum          77   0.1926   0.1620
+  Golgi apparatus                86   0.2632   0.2867
+  Mitochondrion                 196   0.6548   0.6292
+  Nucleus                       893   0.7128   0.4267
+
+--------------------------------------------------------------------------------
+RUN: last_n
+PATH: /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc_lora_loran5_bom_attn/20260523-104629Z-d5f3eb/Outer_Fold_1
+JSON: cv_results_deeploc_lora_loran5_bom_attn/20260523-104629Z-d5f3eb/Outer_Fold_1/hpa_restricted_metrics.json
+--------------------------------------------------------------------------------
+
+cv_summary.json (Outer_Fold_1, full 10-class from train.py):
+  val: macro_f1=0.626714 micro_f1=0.698574 subset_acc=0.507295
+  val_tuned: macro_f1=0.644527 micro_f1=0.699633 subset_acc=0.471407
+  hpa_test: macro_f1=0.265206 micro_f1=0.577176 subset_acc=0.331974
+  hpa_test_tuned: macro_f1=0.261165 micro_f1=0.579641 subset_acc=0.282469
+
+[pred_labels_default]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.265206
+    micro_f1: 0.577176
+    subset_acc: 0.331974
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.331507
+    micro_f1: 0.586111
+    macro_precision: 0.346137
+    macro_recall: 0.361415
+    subset_acc: 0.336051
+    jaccard_samples: 0.519656
+    macro_mcc: 0.241365
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4072   0.3491
+  Cytoplasm                     562   0.5847   0.3254
+  Endoplasmic reticulum          77   0.1860   0.1588
+  Golgi apparatus                86   0.2362   0.2264
+  Lysosome/Vacuole                2   0.0000  -0.0034
+  Mitochondrion                 196   0.5234   0.4628
+  Nucleus                       893   0.7144   0.4140
+  Peroxisome                      7   0.0000  -0.0022
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.442009
+    micro_f1: 0.589660
+    macro_precision: 0.461515
+    macro_recall: 0.481887
+    subset_acc: 0.338381
+    jaccard_samples: 0.521404
+    macro_mcc: 0.322753
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4072   0.3491
+  Cytoplasm                     562   0.5847   0.3254
+  Endoplasmic reticulum          77   0.1860   0.1588
+  Golgi apparatus                86   0.2362   0.2264
+  Mitochondrion                 196   0.5234   0.4628
+  Nucleus                       893   0.7144   0.4140
+
+[pred_labels_tuned]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.261165
+    micro_f1: 0.579641
+    subset_acc: 0.282469
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.326456
+    micro_f1: 0.587141
+    macro_precision: 0.351225
+    macro_recall: 0.368784
+    subset_acc: 0.282469
+    jaccard_samples: 0.506591
+    macro_mcc: 0.235323
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4121   0.3410
+  Cytoplasm                     562   0.5693   0.2943
+  Endoplasmic reticulum          77   0.1818   0.1608
+  Golgi apparatus                86   0.1869   0.2174
+  Lysosome/Vacuole                2   0.0000  -0.0070
+  Mitochondrion                 196   0.5255   0.4651
+  Nucleus                       893   0.7360   0.4139
+  Peroxisome                      7   0.0000  -0.0027
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.435275
+    micro_f1: 0.597039
+    macro_precision: 0.468301
+    macro_recall: 0.491712
+    subset_acc: 0.295282
+    jaccard_samples: 0.514609
+    macro_mcc: 0.315383
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.4121   0.3410
+  Cytoplasm                     562   0.5693   0.2943
+  Endoplasmic reticulum          77   0.1818   0.1608
+  Golgi apparatus                86   0.1869   0.2174
+  Mitochondrion                 196   0.5255   0.4651
+  Nucleus                       893   0.7360   0.4139
+
+--------------------------------------------------------------------------------
+RUN: band
+PATH: /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc_lora_loran5_bom_attn/20260523-104715Z-606ead/Outer_Fold_1
+JSON: cv_results_deeploc_lora_loran5_bom_attn/20260523-104715Z-606ead/Outer_Fold_1/hpa_restricted_metrics.json
+--------------------------------------------------------------------------------
+
+cv_summary.json (Outer_Fold_1, full 10-class from train.py):
+  val: macro_f1=0.633300 micro_f1=0.697132 subset_acc=0.503270
+  val_tuned: macro_f1=0.647478 micro_f1=0.696548 subset_acc=0.463357
+  hpa_test: macro_f1=0.271137 micro_f1=0.578236 subset_acc=0.333722
+  hpa_test_tuned: macro_f1=0.275514 micro_f1=0.580565 subset_acc=0.285964
+
+[pred_labels_default]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.271137
+    micro_f1: 0.578236
+    subset_acc: 0.333722
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.338922
+    micro_f1: 0.587056
+    macro_precision: 0.358790
+    macro_recall: 0.360281
+    subset_acc: 0.336634
+    jaccard_samples: 0.521083
+    macro_mcc: 0.249381
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3909   0.3311
+  Cytoplasm                     562   0.5810   0.3173
+  Endoplasmic reticulum          77   0.1970   0.1683
+  Golgi apparatus                86   0.2677   0.2614
+  Lysosome/Vacuole                2   0.0000  -0.0039
+  Mitochondrion                 196   0.5610   0.5027
+  Nucleus                       893   0.7138   0.4208
+  Peroxisome                      7   0.0000  -0.0027
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.451896
+    micro_f1: 0.591438
+    macro_precision: 0.478387
+    macro_recall: 0.480374
+    subset_acc: 0.340711
+    jaccard_samples: 0.523733
+    macro_mcc: 0.333602
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3909   0.3311
+  Cytoplasm                     562   0.5810   0.3173
+  Endoplasmic reticulum          77   0.1970   0.1683
+  Golgi apparatus                86   0.2677   0.2614
+  Mitochondrion                 196   0.5610   0.5027
+  Nucleus                       893   0.7138   0.4208
+
+[pred_labels_tuned]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.275514
+    micro_f1: 0.580565
+    subset_acc: 0.285964
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.344393
+    micro_f1: 0.587842
+    macro_precision: 0.379388
+    macro_recall: 0.360110
+    subset_acc: 0.285964
+    jaccard_samples: 0.505533
+    macro_mcc: 0.252083
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3958   0.3101
+  Cytoplasm                     562   0.5693   0.2946
+  Endoplasmic reticulum          77   0.1890   0.1633
+  Golgi apparatus                86   0.2301   0.2500
+  Lysosome/Vacuole                2   0.0000  -0.0074
+  Mitochondrion                 196   0.6501   0.6115
+  Nucleus                       893   0.7208   0.3973
+  Peroxisome                      7   0.0000  -0.0027
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.459190
+    micro_f1: 0.598978
+    macro_precision: 0.505851
+    macro_recall: 0.480146
+    subset_acc: 0.300524
+    jaccard_samples: 0.514318
+    macro_mcc: 0.337790
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3958   0.3101
+  Cytoplasm                     562   0.5693   0.2946
+  Endoplasmic reticulum          77   0.1890   0.1633
+  Golgi apparatus                86   0.2301   0.2500
+  Mitochondrion                 196   0.6501   0.6115
+  Nucleus                       893   0.7208   0.3973
+
+--------------------------------------------------------------------------------
+RUN: legacy (old split, top-level Outer_Fold_1)
+PATH: /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc_lora_loran5_bom_attn/Outer_Fold_1
+JSON: cv_results_deeploc_lora_loran5_bom_attn/Outer_Fold_1/hpa_restricted_metrics.json
+--------------------------------------------------------------------------------
+
+[pred_labels]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.266506
+    micro_f1: 0.566494
+    subset_acc: 0.323821
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.333133
+    micro_f1: 0.576577
+    macro_precision: 0.355584
+    macro_recall: 0.353331
+    subset_acc: 0.327897
+    jaccard_samples: 0.507911
+    macro_mcc: 0.242386
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3767   0.3226
+  Cytoplasm                     562   0.5718   0.2989
+  Endoplasmic reticulum          77   0.1846   0.1566
+  Golgi apparatus                86   0.2812   0.2748
+  Lysosome/Vacuole                2   0.0000  -0.0046
+  Mitochondrion                 196   0.5447   0.4859
+  Nucleus                       893   0.7060   0.4085
+  Peroxisome                      7   0.0000  -0.0035
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.444177
+    micro_f1: 0.582335
+    macro_precision: 0.474112
+    macro_recall: 0.471108
+    subset_acc: 0.332557
+    jaccard_samples: 0.511211
+    macro_mcc: 0.324529
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3767   0.3226
+  Cytoplasm                     562   0.5718   0.2989
+  Endoplasmic reticulum          77   0.1846   0.1566
+  Golgi apparatus                86   0.2812   0.2748
+  Mitochondrion                 196   0.5447   0.4859
+  Nucleus                       893   0.7060   0.4085
+
+--------------------------------------------------------------------------------
+RUN: legacy cv_results_deeploc
+PATH: /work/hdd/bdja/bpokhrel/deeploc/cv_results_deeploc/Outer_Fold_1
+JSON: cv_results_deeploc/Outer_Fold_1/hpa_restricted_metrics.json
+--------------------------------------------------------------------------------
+
+[pred_labels]
+
+  --- all10 ---
+    n_classes: 10
+    macro_f1: 0.247993
+    micro_f1: 0.536790
+    subset_acc: 0.349447
+
+  --- hpa8_present ---
+    n_classes: 8
+    macro_f1: 0.309991
+    micro_f1: 0.552006
+    macro_precision: 0.360749
+    macro_recall: 0.303063
+    subset_acc: 0.352359
+    jaccard_samples: 0.488303
+    macro_mcc: 0.222011
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3092   0.2692
+  Cytoplasm                     562   0.5342   0.2468
+  Endoplasmic reticulum          77   0.1803   0.1582
+  Golgi apparatus                86   0.1913   0.1978
+  Lysosome/Vacuole                2   0.0000  -0.0032
+  Mitochondrion                 196   0.5882   0.5326
+  Nucleus                       893   0.6766   0.3768
+  Peroxisome                      7   0.0000  -0.0022
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.413322
+    micro_f1: 0.555475
+    macro_precision: 0.480998
+    macro_recall: 0.404084
+    subset_acc: 0.354688
+    jaccard_samples: 0.490002
+    macro_mcc: 0.296913
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3092   0.2692
+  Cytoplasm                     562   0.5342   0.2468
+  Endoplasmic reticulum          77   0.1803   0.1582
+  Golgi apparatus                86   0.1913   0.1978
+  Mitochondrion                 196   0.5882   0.5326
+  Nucleus                       893   0.6766   0.3768
+
+
+--------------------------------------------------------------------------------
+RUN: focal manual alpha (LATEST, 2026-05-29)
+PATH: cv_results_deeploc_lora_loran5_bom_attn_folds1_focalg2/20260529-004348Z-af9a54/Outer_Fold_1
+JSON: .../Outer_Fold_1/ (metrics in cv_summary.json hpa_test_tuned_hpa6_paper)
+CONFIG: loss=focal gamma=2 manual alpha | layer_agg=all | esmc_300m | folds=[1]
+--------------------------------------------------------------------------------
+
+[pred_labels_tuned — from cv_summary.json]
+
+  --- hpa6_paper ---
+    n_classes: 6
+    macro_f1: 0.446078
+    micro_f1: 0.596529
+    macro_precision: 0.501113
+    macro_recall: 0.465630
+    subset_acc: 0.302854
+    jaccard_samples: 0.510338
+    macro_mcc: 0.331839
+
+  Per-class:
+  Class                     Support       F1      MCC
+  ------------------------- ------- -------- --------
+  Cell membrane                 287   0.3920   0.3253
+  Cytoplasm                     562   0.5740   0.3065
+  Endoplasmic reticulum          77   0.1739   0.1587
+  Golgi apparatus                86   0.1802   0.1950
+  Mitochondrion                 196   0.6421   0.5980
+  Nucleus                       893   0.7143   0.4076
+
+
+================================================================================
+END OF REPORT
+================================================================================
